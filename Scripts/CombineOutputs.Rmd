@@ -1,0 +1,24 @@
+---
+title: "Untitled"
+author: "Pierson Cooke"
+date: "2023-04-20"
+output: html_document
+---
+
+```{r}
+
+library(dplyr)
+library(tidyverse)
+
+elastic <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/elastic_outputs.csv')
+elastic <- elastic[,-c(1, 7, 8)]
+xgb <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/xgboost_outputs.csv')
+xgb <- xgb[,-1]
+```
+
+```{r}
+
+final_outputs_combined <- rbind(elastic, xgb)
+write.csv(final_outputs_combined, '/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/final_outputs.csv')
+```
+

@@ -1,0 +1,934 @@
+---
+title: "XGBoost"
+author: "Pierson Cooke"
+date: "2023-03-30"
+output: html_document
+---
+
+# Load libraries and data sets
+
+```{r warning=FALSE}
+
+library(xgboost)
+library(caret)
+library(OptimalCutpoints)
+library(ggplot2)
+library(xgboostExplainer)
+library(pROC)
+library(SHAPforxgboost)
+library(ISLR)
+```
+
+Read data and drop idx col
+```{r}
+
+setwd("/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Scripts")
+
+smote <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train_smote.csv')
+smote$arrest_made <- as.factor(smote$arrest_made)
+smote <- smote[,-1]
+
+under <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train_under.csv')
+under$arrest_made <- as.factor(under$arrest_made)
+under <- under[,-1]
+
+test <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/test.csv')
+test$arrest_made <- as.factor(test$arrest_made)
+test <- test[,-1]
+```
+
+# XGBoost Intro
+
+```{r}
+
+dtrain1 <- xgb.DMatrix(data = as.matrix(smote[,2:93]), label = as.numeric(smote$arrest_made)-1)
+dtrain2 <- xgb.DMatrix(data = as.matrix(under[,2:93]), label = as.numeric(under$arrest_made)-1)
+
+dtest <- xgb.DMatrix(data = as.matrix(test[,2:93]), label = as.numeric(test$arrest_made)-1)
+```
+
+
+## Smote Data
+
+#### Initial Model
+
+```{r}
+
+set.seed(123)
+
+smote1 <- xgboost(
+  data = dtrain1, 
+  nrounds = 200, 
+  verbose = 1, 
+  print_every_n = 20, 
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eval_metric = "error"
+)
+```
+
+Make initial predictions on test data
+``` {r}
+
+smote_pred1 <- predict(smote1, dtest)
+smote_pred_df1 <- cbind.data.frame(smote_pred1, test$arrest_made)
+```
+
+Loop through different cutoff values
+```{r}
+
+final_df0 <- data.frame()
+
+for (x in seq(0.25, 0.95, by = 0.01)) {
+  
+  smote_pred_class <- rep(0, length(smote_pred1))
+  smote_pred_class[smote_pred1 >= x] <- 1
+  
+  smote_final_table <- table(smote_pred_class, test$arrest_made)
+  CM <- confusionMatrix(smote_final_table, positive = "1")
+  
+  Accuracy <- CM[["overall"]][["Accuracy"]]
+  Sensitivity <- CM[["byClass"]][["Sensitivity"]]
+  Specificity <- CM[["byClass"]][["Specificity"]]
+  Balanced_Accuracy <- CM[["byClass"]][["Balanced Accuracy"]]
+  
+  DF_row <- list(x, Accuracy, Sensitivity, Specificity, Balanced_Accuracy)
+  
+  final_df0 <- rbind(final_df0, DF_row)
+  
+}
+
+names(final_df0) <- c("Cutoff", "Accuracy", "Sensitivity", "Specificity", "Balance Accuracy")
+
+```
+
+Find which cutoff has the best balance accuracy
+```{r}
+
+(cutoff1 <- final_df0[which.max(final_df0$`Balance Accuracy`) ,]$Cutoff)
+```
+
+
+``` {r}
+
+smote_pred1_class <- rep(0, length(smote_pred1))
+smote_pred1_class[smote_pred1 >= cutoff1] <- 1
+
+trythis <- table(smote_pred1_class, test$arrest_made)
+(CM_first_smote <- confusionMatrix(trythis, positive = "1"))
+```
+
+
+#### Tune Model
+
+Ensure we run enough rounds to maximize accuracy
+```{r}
+smote2 <- xgb.cv(
+  data = dtrain1, 
+  nfold = 5,
+  eta = 0.1,
+  nrounds = 1000, 
+  early_stopping_rounds = 50,
+  verbose = 1,
+  nthread = 1,
+  print_every_n = 20,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eval_metric = "error"
+)
+```
+
+Running CV to test different combinations of max depth and min child weight 
+```{r}
+
+set.seed(123)
+
+max_depth_vals <- c(3, 5, 7, 10, 15)
+min_child_weight <- c(1,3,5,7, 10, 15) 
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+
+for (i in 1:nrow(cv_params)) {
+  
+  smote2 <- xgb.cv(
+    data = dtrain1, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = cv_params$max_depth[i], 
+    min_child_weight = cv_params$min_child_weight[i],
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  auc_vec[i] <- smote2$evaluation_log$test_auc_mean[smote2$best_ntreelimit]
+  error_vec[i] <- smote2$evaluation_log$test_error_mean[smote2$best_ntreelimit]
+  
+}
+```
+
+Build table to view AUC and Error of each max depth and min child weight combination
+```{r}
+
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$max_depth <- as.factor(res_db$max_depth)
+res_db$min_child_weight <- as.factor(res_db$min_child_weight)
+
+res_db
+```
+
+Set max depth to 10 and min child weight to 3
+```{r}
+
+res_db[which.min(res_db$error),]
+res_db[which.max(res_db$auc),]
+```
+
+Tune the gamma values
+```{r}
+
+set.seed(123)
+
+gamma_vals <- c(0, 0.05, 0.1, 0.15, 0.20)
+auc_vec <- error_vec <- rep(NA, length(gamma_vals))
+
+for (i in 1:length(gamma_vals)) {
+  
+  smote2 <- xgb.cv(
+    data = dtrain1, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = 10, 
+    min_child_weight = 3,
+    gamma = gamma_vals[i],
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  auc_vec[i] <- smote2$evaluation_log$test_auc_mean[smote2$best_ntreelimit]
+  error_vec[i] <- smote2$evaluation_log$test_error_mean[smote2$best_ntreelimit]
+  
+}
+```
+
+Shows best gamma based on AUC and Error values; choose gamma = 0.15 because it has highest AUC and lowest relative Error
+```{r}
+
+cbind.data.frame(gamma_vals, auc_vec, error_vec)
+```
+
+
+Use this to make sure n-rounds still works as intended
+```{r}
+
+set.seed(123)
+
+smote2 <- xgb.cv(
+    data = dtrain1, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = 10, 
+    min_child_weight = 3,
+    gamma = 0.15,
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+)
+```
+
+Tune the subsample and colsample_by_tree parameters
+```{r}
+
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1)
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1)
+cv_params <- expand.grid(subsample, colsample_by_tree)
+names(cv_params) <- c("subsample", "colsample_by_tree")
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+
+
+for (i in 1:nrow(cv_params)) {
+  
+  smote2 <- xgb.cv(
+    data = dtrain1, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = 10, 
+    min_child_weight = 3,
+    gamma = 0.15,
+    subsample = cv_params$subsample[i],
+    colsample_bytree = cv_params$colsample_by_tree[i],
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  auc_vec[i] <- smote2$evaluation_log$test_auc_mean[smote2$best_ntreelimit]
+  error_vec[i] <- smote2$evaluation_log$test_error_mean[smote2$best_ntreelimit]
+  
+}
+```
+
+Select best `subsample` and `colsample_by_tree` values to maximize AUC and minimize Error
+```{r}
+
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$subsample <- as.factor(res_db$subsample) # Convert tree number to factor for plotting
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree) # Convert node size to factor for plotting
+```
+
+Choose `subsample` value of 1 and `colsample_by_tree` value of 0.9
+```{r}
+
+res_db[which.max(res_db$auc), ]
+res_db[which.min(res_db$error), ]
+```
+
+Why use CV at this stage?
+```{r}
+
+set_eta <- function(input_eta) {
+  
+  set.seed(123)
+  
+  smote2 <- xgb.cv(
+    data = dtrain1, 
+    nfold = 5,
+    eta = input_eta,
+    max.depth = 10, 
+    min_child_weight = 3,
+    gamma = 0.15,
+    subsample = 1,
+    colsample_bytree = 0.9,
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+    )
+  
+  return(smote2)
+  
+}
+```
+
+Apply different learning rates to the model
+```{r}
+
+eta_03 <- set_eta(0.3)
+eta_01 <- set_eta(0.1)
+eta_005 <- set_eta(0.05)
+eta_001 <- set_eta(0.01)
+eta_0005 <- set_eta(0.005)
+```
+
+Write function that will create data frames with all the 
+```{r}
+
+final_rows <- function(xgbmodel, eta_vals) {
+  
+  temp_df <- cbind.data.frame(xgbmodel$evaluation_log[,c("iter", "test_error_mean")], rep(eta_vals, nrow(xgbmodel$evaluation_log)))
+  names(temp_df)[3] <- "eta"
+  
+  return(temp_df)
+}
+```
+
+Append the data with iterrations and rows 
+```{r}
+
+final_table <- rbind(final_rows(eta_03, 0.3), final_rows(eta_01, 0.1), final_rows(eta_005, 0.05), final_rows(eta_001, 0.01), final_rows(eta_0005, 0.005))
+
+final_table[which.min(final_table$test_error_mean), ]
+```
+
+Plot for best learning rate
+```{r}
+
+ggplot(final_table, aes(x = iter, y = test_error_mean, color = factor(eta), group = factor(eta))) + 
+  geom_smooth(alpha = 0.5)
+```
+
+Final model after tuning
+```{r}
+
+set.seed(123)
+
+smoteFinal<- xgboost(
+  data = dtrain1, 
+  nfold = 5,
+  eta = 0.1,
+  max.depth = 10, 
+  min_child_weight = 3,
+  gamma = 0.15,
+  subsample = 1,
+  colsample_bytree = 0.9,
+  nrounds = 175,
+  early_stopping_rounds = 20,
+  verbose = 1,
+  nthread = 1,
+  print_every_n = 20,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eval_metric = "error"
+  )
+```
+
+Make predictions using the fully tuned model
+```{r}
+
+smote_pred_final <- predict(smoteFinal, dtest)
+smote_pred_final_df <- cbind.data.frame(smote_pred_final, test$arrest_made)
+```
+
+Loop through different cutoff values
+```{r}
+
+final_df1 <- data.frame()
+
+for (x in seq(0.25, 0.95, by = 0.01)) {
+  
+  smote_pred_final_class <- rep(0, length(smote_pred_final))
+  smote_pred_final_class[smote_pred_final >= x] <- 1
+  
+  smote_final_table <- table(smote_pred_final_class, test$arrest_made)
+  CM <- confusionMatrix(smote_final_table, positive = "1")
+  
+  Accuracy <- CM[["overall"]][["Accuracy"]]
+  Sensitivity <- CM[["byClass"]][["Sensitivity"]]
+  Specificity <- CM[["byClass"]][["Specificity"]]
+  Balanced_Accuracy <- CM[["byClass"]][["Balanced Accuracy"]]
+  
+  DF_row <- list(x, Accuracy, Sensitivity, Specificity, Balanced_Accuracy)
+  
+  final_df1 <- rbind(final_df1, DF_row)
+  
+}
+
+names(final_df1) <- c("Cutoff", "Accuracy", "Sensitivity", "Specificity", "Balance Accuracy")
+
+```
+
+Find which cutoff has the best balance accuracy
+```{r}
+
+cutoff2 <- final_df1[which.max(final_df1$`Balance Accuracy`) ,]$Cutoff
+```
+
+Use this for the final 
+``` {r}
+
+smote_pred_final_class <- rep(0, length(smote_pred_final))
+smote_pred_final_class[smote_pred_final >= cutoff2] <- 1
+
+smote_final_table <- table(smote_pred_final_class, test$arrest_made)
+(CM_final_smote <- confusionMatrix(smote_final_table, positive = "1"))
+```
+
+```{r}
+CM_first_smote
+CM_final_smote
+```
+
+## Undersampled Data
+
+#### Initial Model
+
+Run basic XGBoost model on the under sampled data
+```{r}
+
+set.seed(123)
+
+under1 <- xgboost(
+  data = dtrain2, 
+  nrounds = 200, 
+  verbose = 1, 
+  print_every_n = 20, 
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eval_metric = "error"
+)
+```
+
+Make initial predictions on test data
+``` {r}
+
+under_pred1 <- predict(under1, dtest)
+under_pred_df1 <- cbind.data.frame(under_pred1, test$arrest_made)
+```
+
+Loop through different cutoff values
+```{r}
+
+final_df2 <- data.frame()
+
+for (x in seq(0.25, 0.95, by = 0.01)) {
+  
+  under_pred_class <- rep(0, length(under_pred1))
+  under_pred_class[under_pred1 >= x] <- 1
+  
+  under_final_table <- table(under_pred_class, test$arrest_made)
+  CM <- confusionMatrix(under_final_table, positive = "1")
+  
+  Accuracy <- CM[["overall"]][["Accuracy"]]
+  Sensitivity <- CM[["byClass"]][["Sensitivity"]]
+  Specificity <- CM[["byClass"]][["Specificity"]]
+  Balanced_Accuracy <- CM[["byClass"]][["Balanced Accuracy"]]
+  
+  DF_row <- list(x, Accuracy, Sensitivity, Specificity, Balanced_Accuracy)
+  
+  final_df2 <- rbind(final_df2, DF_row)
+  
+}
+
+names(final_df2) <- c("Cutoff", "Accuracy", "Sensitivity", "Specificity", "Balance Accuracy")
+
+```
+
+Find which cutoff has the best balance accuracy
+```{r}
+
+(cutoff3 <- final_df2[which.max(final_df2$`Balance Accuracy`) ,]$Cutoff)
+```
+
+Apply this value as the cutoff point and make predictions. We see that this model does a good job and has a higher out-of-box balance accuracy than the models built on the SMOTE data.
+``` {r}
+
+under_pred1_class <- rep(0, length(under_pred1))
+under_pred1_class[under_pred1 >= cutoff3] <- 1
+
+trythis <- table(under_pred1_class, test$arrest_made)
+(CM_first_under <- confusionMatrix(trythis, positive = "1"))
+```
+
+#### Trained Model
+
+Essentially want to replicate the steps done with the SMOTE data in order to tune models using the under-sampled data. Ensure that the code below is running enough iterations.
+```{r}
+
+under2 <- xgb.cv(
+  data = dtrain2,
+  nfold = 5,
+  eta = 0.1, 
+  nrounds = 1000,
+  early_stopping_rounds = 50, 
+  verbose = 1,
+  nthread = 1,
+  print_every_n = 20,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eval_metric = "error"
+)
+```
+
+Tune max depth and min child weight
+```{r}
+
+set.seed(123)
+
+max_depth_vals <- c(3, 5, 7, 10, 15)
+min_child_weight <- c(1,3,5,7, 10, 15) 
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+
+for (i in 1:nrow(cv_params)) {
+  
+  under2 <- xgb.cv(
+    data = dtrain2, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = cv_params$max_depth[i], 
+    min_child_weight = cv_params$min_child_weight[i],
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  auc_vec[i] <- under2$evaluation_log$test_auc_mean[under2$best_ntreelimit]
+  error_vec[i] <- under2$evaluation_log$test_error_mean[under2$best_ntreelimit]
+  
+}
+```
+
+Build table to view AUC and Error of each max depth and min child weight combination
+```{r}
+
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$max_depth <- as.factor(res_db$max_depth)
+res_db$min_child_weight <- as.factor(res_db$min_child_weight)
+
+res_db
+```
+
+Set max depth to 7 and min child weight to 10
+```{r}
+
+res_db[which.min(res_db$error),]
+res_db[which.max(res_db$auc),]
+```
+
+Tune the gamma values
+```{r}
+
+set.seed(123)
+
+gamma_vals <- c(0, 0.05, 0.1, 0.15, 0.20)
+auc_vec <- error_vec <- rep(NA, length(gamma_vals))
+
+for (i in 1:length(gamma_vals)) {
+  
+  under2 <- xgb.cv(
+    data = dtrain2, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = 7, 
+    min_child_weight = 10,
+    gamma = gamma_vals[i],
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  auc_vec[i] <- under2$evaluation_log$test_auc_mean[under2$best_ntreelimit]
+  error_vec[i] <- under2$evaluation_log$test_error_mean[under2$best_ntreelimit]
+  
+}
+```
+
+Shows best gamma based on AUC and Error values; choose gamma = 0.15 because it has highest AUC and lowest relative Error
+```{r}
+
+cbind.data.frame(gamma_vals, auc_vec, error_vec)
+```
+
+Check number of necessary iterations (change gamma vals)
+```{r}
+
+under2 <- xgb.cv(
+  data = dtrain2, 
+  nfold = 5,
+  eta = 0.1,
+  max.depth = 7, 
+  min_child_weight = 10,
+  gamma = 0.15,
+  nrounds = 500, 
+  early_stopping_rounds = 20,
+  verbose = 1,
+  nthread = 1,
+  print_every_n = 20,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eval_metric = "error"
+)
+```
+
+Try different sample and sub-sample combinations
+```{r}
+
+set.seed(123)
+
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1)
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1)
+cv_params <- expand.grid(subsample, colsample_by_tree)
+names(cv_params) <- c("subsample", "colsample_by_tree")
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+
+for (i in 1:nrow(cv_params)) {
+  
+  under2 <- xgb.cv(
+    data = dtrain2, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = 7, 
+    min_child_weight = 10,
+    gamma = 0.15,
+    subsample = cv_params$subsample[i],
+    colsample_bytree = cv_params$colsample_by_tree[i],
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  auc_vec[i] <- under2$evaluation_log$test_auc_mean[under2$best_ntreelimit]
+  error_vec[i] <- under2$evaluation_log$test_error_mean[under2$best_ntreelimit]
+  
+}
+```
+
+Create table to select best colsample_by_tree and subsample values
+```{r}
+
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$subsample <- as.factor(res_db$subsample)
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree) 
+```
+
+Set colsample_by_tree to --- and subsample to --- 
+```{r}
+
+res_db[which.min(res_db$error),]
+res_db[which.max(res_db$auc),]
+```
+
+
+```{r}
+
+set_eta2 <- function(input_eta) {
+  
+  set.seed(123)
+  
+  under2 <- xgb.cv(
+    data = dtrain2, 
+    nfold = 5,
+    eta = input_eta,
+    max.depth = 7, 
+    min_child_weight = 10,
+    gamma = 0.15,
+    subsample = 0.9,
+    colsample_bytree = 0.6,
+    nrounds = 500, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+  )
+  
+  return(under2)
+  
+}
+```
+
+
+Run models with different ETA values
+```{r}
+
+eta_under_03 <- set_eta2(0.3)
+eta_under_01 <- set_eta2(0.1)
+eta_under_005 <- set_eta2(0.05)
+eta_under_001 <- set_eta2(0.01)
+eta_under_0005 <- set_eta2(0.005)
+```
+
+Append the data with iterrations and rows 
+```{r}
+
+final_table2 <- rbind(final_rows(eta_under_03, 0.3), final_rows(eta_under_01, 0.1), final_rows(eta_under_005, 0.05), final_rows(eta_under_001, 0.01), final_rows(eta_under_0005, 0.005))
+```
+
+Stick with ETA of 0.1
+```{r}
+
+ggplot(final_table2, aes(x = iter, y = test_error_mean, color = factor(eta), group = factor(eta))) + 
+  geom_smooth(alpha = 0.5)
+```
+
+
+```{r}
+
+underFinal <- xgboost(
+    data = dtrain2, 
+    nfold = 5,
+    eta = 0.1,
+    max.depth = 7, 
+    min_child_weight = 10,
+    gamma = 0.15,
+    subsample = 0.9,
+    colsample_bytree = 0.6,
+    nrounds = 140, 
+    early_stopping_rounds = 20,
+    verbose = 1,
+    nthread = 1,
+    print_every_n = 20,
+    objective = "binary:logistic",
+    eval_metric = "auc",
+    eval_metric = "error"
+)
+```
+
+Make predictions using the fully tuned model
+```{r}
+
+under_pred_final <- predict(underFinal, dtest)
+under_pred_final_df <- cbind.data.frame(under_pred_final, test$arrest_made)
+```
+
+Loop through different cutoff values
+```{r}
+
+final_df1 <- data.frame()
+
+for (x in seq(0.25, 0.95, by = 0.01)) {
+  
+  under_pred_final_class <- rep(0, length(under_pred_final))
+  under_pred_final_class[under_pred_final >= x] <- 1
+  
+  under_final_table <- table(under_pred_final_class, test$arrest_made)
+  CM <- confusionMatrix(under_final_table, positive = "1")
+  
+  Accuracy <- CM[["overall"]][["Accuracy"]]
+  Sensitivity <- CM[["byClass"]][["Sensitivity"]]
+  Specificity <- CM[["byClass"]][["Specificity"]]
+  Balanced_Accuracy <- CM[["byClass"]][["Balanced Accuracy"]]
+  
+  DF_row <- list(x, Accuracy, Sensitivity, Specificity, Balanced_Accuracy)
+  
+  final_df1 <- rbind(final_df1, DF_row)
+  
+}
+
+names(final_df1) <- c("Cutoff", "Accuracy", "Sensitivity", "Specificity", "Balance Accuracy")
+
+```
+
+Find which cutoff has the best balance accuracy
+```{r}
+
+(cutoff4 <- final_df1[which.max(final_df1$`Balance Accuracy`) ,]$Cutoff)
+```
+
+Use this for the final 
+``` {r}
+
+under_pred_final_class <- rep(0, length(under_pred_final))
+under_pred_final_class[under_pred_final >= cutoff4] <- 1
+
+under_final_table <- table(under_pred_final_class, test$arrest_made)
+(CM_final_under <- confusionMatrix(under_final_table, positive = "1"))
+```
+
+```{r}
+CM_first_under
+CM_final_under
+```
+
+## Compile 4 models
+
+```{r}
+
+CM_list <- list(CM_first_smote, CM_final_smote, CM_first_under, CM_final_under)
+pred_list <- list(smote_pred1, smote_pred_final, under_pred1, under_pred_final)
+```
+
+Rerun this and find error
+```{r}
+
+model_eval <- data.frame()
+
+for (i in 1:4){
+  
+  temp_CM <- CM_list[[i]]
+  temp_pred <- pred_list[[i]]
+  
+  accur <- temp_CM[["overall"]][["Accuracy"]]
+  sensit <- temp_CM[["byClass"]][["Sensitivity"]]
+  specif <- temp_CM[["byClass"]][["Specificity"]]
+  bal <- temp_CM[["byClass"]][["Balanced Accuracy"]]
+  #lam <- models[[paste0("alpha",j)]][["lambda.1se"]]
+  
+  temp_roc <- roc(test$arrest_made, temp_pred)
+  temp_roc <- temp_roc$auc
+
+
+  temp_df <- data.frame(Model_Accuracy = accur, Model_Sensitivity = sensit,
+                        Model_Specificity = specif, Model_Balance = bal,
+                        Auc = temp_roc)
+  #temp_df$Model_Type
+  #temp_df$Input_Data
+
+  if (i == 1){
+    temp_df$Model_Type <- "XGBoost No Tuning"
+    temp_df$Input_Data <- "Smote Data"
+  } else if (i == 2){
+    temp_df$Model_Type <- "XGBoost Tuned"
+    temp_df$Input_Data <- "Smote Data"
+  } else if (i == 3){
+    temp_df$Model_Type <- "XGBoost No Tuning"
+    temp_df$Input_Data <- "Undersampled Data"
+  } else {
+    temp_df$Model_Type <- "XGBoost Tuned"
+    temp_df$Input_Data <- "Undersampled Data"
+  }
+
+  model_eval <- rbind(model_eval, temp_df)
+
+}
+```
+
+```{r}
+# write.csv(model_eval, "xgboost_outputs.csv")
+```
+
+
+```{r}
+
+imp_mat <- xgb.importance(model = smoteFinal)
+(xgb_importance1 <- xgb.plot.importance(imp_mat, top_n = 15))
+
+save(xgb_importance1, file = "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Plots:Outputs/importance_matrix1.rda")
+```
+
+```{r}
+
+library(ggforce)
+source("a_insights_shap_functions.r")
+
+shap_result <- shap.score.rank(xgb_model = smoteFinal, 
+                               X_train = as.matrix(smote[,2:93]),
+                               shap_approx = F)
+
+shap_long = shap.prep(shap = shap_result,
+                      X_train = as.matrix(smote[,2:93]), 
+                      top_n = 20)
+
+
+(xgb_shap1 <- plot.shap.summary(data_long = shap_long))
+
+save(xgb_shap1, file = "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Plots:Outputs/shap.rda")
+```

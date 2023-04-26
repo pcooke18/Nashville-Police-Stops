@@ -1,0 +1,207 @@
+---
+title: "Police Data Cleaning"
+author: "Pierson Cooke"
+date: "2023-03-13"
+output: html_document
+---
+
+# Initial Data Cleaning
+
+```{r Load original dataset}
+
+police <- readRDS("/Users/piersoncooke/Desktop/Files to Upload to GitHub/After Cleaning Data Nashville/police.rds")
+```
+
+```{r warning=FALSE}
+library(tidyverse)
+library(fastDummies)
+library(corrplot)
+library(forcats)
+library(leaps)
+library(lubridate)
+library(caret)
+library(DMwR)
+```
+
+```{r}
+colnames(police)
+```
+
+Removed: row number (1), location (4), reporting area/zone (8-9), hash id/type (13-14), citation/warning issued/outcome (17-19), contraband found (20), reason for stop (28), notes and all raw columns (30-42)
+```{r}
+police2 <- police[,-c(1,4,8:9,13:14,17:20,25:26,28,30:42)]
+colnames(police2)
+```
+
+Get percent missing for each column
+```{r}
+na_count <-sapply(police2, function(y) sum(length(which(is.na(y)))))
+na_count <- as.data.frame(na_count)
+
+colnames(na_count)[1] <- "totalmissing"
+na_count$percentmissing <- round((na_count$totalmissing/nrow(police2)) * 100,2)
+
+na_count[2]
+```
+
+Fill missing values of contraband found with False
+```{r}
+police2["contraband_drugs"][is.na(police2["contraband_drugs"])] <- FALSE
+police2["contraband_weapons"][is.na(police2["contraband_weapons"])] <- FALSE
+```
+
+Fill in missing data for categorical variables. 
+``` {r}
+
+# Precinct
+police2["precinct"][is.na(police2["precinct"])] <- "U"
+police2["precinct"][police2["precinct"] == "U"] <- "unknown"
+
+# Violation 
+police2["violation"][is.na(police2["violation"])] <- "unknown"
+```
+
+Fill in "unknown" class for NAs in factor variables
+```{r}
+
+police2$subject_race <- fct_explicit_na(police2$subject_race, "unknown")
+police2$subject_sex <- fct_explicit_na(police2$subject_sex, "unknown")
+#police2$outcome <- fct_explicit_na(police2$outcome, "unknown")
+police2$search_basis <- fct_explicit_na(police2$search_basis, "unknown") # 95.87% missing
+police2$vehicle_registration_state <- fct_explicit_na(police2$vehicle_registration_state, "unknown")
+```
+
+Again, check amount of missing data
+```{r}
+na_count2 <-sapply(police2, function(y) sum(length(which(is.na(y)))))
+na_count2<- as.data.frame(na_count2)
+
+colnames(na_count2)[1] <- "totalmissing"
+na_count2$percentmissing <- round((na_count2$totalmissing/nrow(police2)) * 100,2)
+
+na_count2[2]
+```
+
+```{r}
+str(police2)
+```
+
+
+```{r}
+which(sapply(police2, is.logical))
+```
+
+Omit NAs (mostly delete observations missing lat and long data)
+```{r}
+
+police3 <- na.omit(police2)
+police3[,c(10:14)] <- lapply(police3[,c(10:14)], as.numeric)
+```
+
+Get column converting date and time variables into a numeric format
+```{r}
+
+police3$datetime <- paste(police3$date, police3$time)
+police3$time_elapsed <- as.numeric(difftime(police3$datetime, ymd_hms("1970-01-01 00:00:00"), units = "mins"))
+```
+
+Remove arrest made and citation issued because this information is stored in outcome, which we are adding to the dummy col function. Also take out date, time, and datetime to ensure all variables will be numeric for the purpose of ML.
+
+```{r}
+
+police3$precinct <- as.factor(police3$precinct)
+police3$violation <- as.factor(police3$violation)
+
+police4 <- police3[,-c(1:2,17)]
+```
+
+Create dummy cols from the categorical data
+```{r}
+
+police4 <- dummy_cols(police4, select_columns = c("precinct", "subject_race", 
+                                                  "subject_sex", "violation", "search_basis",
+                                                  "vehicle_registration_state"), 
+                      remove_selected_columns = T)
+```
+
+Remove all columns where there is only one type of data
+```{r}
+police4 <- police4 %>% 
+  relocate(arrest_made, everything())
+
+rm_homogeneous <- function (df) {
+  df[,names(df) %in% names(df)[sapply(df, function(x) {length(unique(x))}) > 1]]
+}
+
+police4 <- rm_homogeneous(police4)
+```
+
+```{r}
+police4corr <- cor(police4[,2:9])
+corrplot(police4corr, order = "AOE")
+```
+
+#Creating Test, Train, and Validation Data
+
+First convert int columns to factor for the purpose to creating synthetic observations using SMOTE
+```{r}
+
+intCols <- sapply(police4, is.integer)
+police4[intCols] <- lapply(police4[intCols], as.factor)
+
+police4$arrest_made <- as.factor(police4$arrest_made)
+```
+
+Create data partitions
+```{r}
+
+indexRows <- createDataPartition(police4$arrest_made, p = 0.7, list = FALSE, times = 1)
+train <- police4[indexRows, ]
+valid_overall <- police4[-indexRows, ]
+
+indexRows2 <- createDataPartition(valid_overall$arrest_made, p = 0.5, list = FALSE, times = 1)
+test <- valid_overall[indexRows2, ]
+validation <- valid_overall[-indexRows2, ]
+```
+
+#Create train data from SMOTE and under-sampling
+
+SMOTE train (doubled the number of + cases but dramatically reduced the nuumber of - cases)
+```{r}
+
+numCols <- sapply(train, is.numeric)
+train[numCols] <- lapply(train[numCols], as.factor)
+
+train <- as.data.frame(train)
+train_smote <- SMOTE(arrest_made ~ ., train, perc.over = 100, k = 5)
+```
+
+Under-sampling
+```{r}
+
+train0 <- train[train$arrest_made == 0, ]
+train1 <- train[train$arrest_made == 1, ]
+
+train0 <- train0[sample(1:nrow(train0), 33584),] #number of positive cases
+
+train_under <- rbind(train0, train1)
+```
+
+
+Write the files to a csv so I can load for further analysis
+```{r}
+
+write.csv(police4, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/policewide.csv")
+write.csv(test, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/test.csv")
+write.csv(validation, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/validation.csv")
+write.csv(train_under, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train_under.csv")
+write.csv(train_smote, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train_smote.csv")
+```
+
+```{r}
+
+write.csv(train, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train.csv")
+write.csv(police3, "/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/police_clean.csv")
+
+```
+

@@ -1,0 +1,171 @@
+---
+title: "Elastic Net"
+author: "Pierson Cooke"
+date: "2023-03-27"
+output: html_document
+---
+
+# Setup 
+
+Load libraries
+```{r warning=FALSE}
+
+library(tidyverse)
+library(dplyr)
+library(glmnet)
+library(caret)
+library(ISLR)
+library(pROC)
+```
+
+Read data and drop idx col
+```{r}
+
+setwd("/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Scripts")
+
+smote <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train_smote.csv')
+smote$arrest_made <- as.factor(smote$arrest_made)
+smote <- smote[,-1]
+
+under <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/train_smote.csv')
+under$arrest_made <- as.factor(under$arrest_made)
+under <- under[,-1]
+
+test <- read.csv('/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/test.csv')
+test$arrest_made <- as.factor(test$arrest_made)
+test <- test[,-1]
+```
+
+Create matrix for function
+```{r}
+
+#Smote Data
+x_data1 <- as.data.frame(scale(smote[,-1]))
+x_data1$arrest_made <- smote$arrest_made
+xvars1 <- model.matrix(arrest_made ~., x_data1)[,-1]
+
+#Under Data
+x_data2 <- as.data.frame(scale(under[,-1]))
+x_data2$arrest_made <- under$arrest_made
+xvars2 <- model.matrix(arrest_made ~., x_data2)[,-1]
+
+#Test
+x_test <- as.data.frame(scale(test[,-1]))
+x_test$arrest_made <- test$arrest_made
+xvarstest <- model.matrix(arrest_made ~., x_test)[,-1]
+
+#Grids for search
+alpha_grid <- seq(0,1, by = 0.05)
+lambda_grid <- 10^seq(-4, 2, by = 0.1)
+```
+
+# Elastic Net
+
+Function to extract information regarding accuracy of all 21 models for each data set
+```{r}
+
+model_sum <- function(inputdata1, inputdata2, alg, datatype) {
+  
+  # Create 21 elastic net models with different alpha and lambda values
+  
+  models <- list()
+
+  for (i in 0:20) {
+    
+    name <- paste0("alpha", i/20)
+    
+    models[[name]] <- cv.glmnet(inputdata1, inputdata2, 
+                                type.measure="deviance", 
+                                family = "binomial",
+                                alpha = i/20,
+                                lambda = lambda_grid, 
+                                nfolds = 5)
+    
+  }
+  
+  # Create confusion matrix for each model
+  
+  conf_matrices <- list()
+  auc_vals <- rep(NA, 21)
+  
+  for (i in 0:20) {
+    
+    name <- paste0("alpha", i/20)
+    
+    predicted <- predict(models[[name]], 
+                         s=models[[name]]$lambda.1se,
+                         newx=xvarstest, type = "response")
+    
+    predicted_class <- ifelse(predicted >= 0.5, 1, 0)
+    
+    predicted_class <- factor(predicted_class, levels=c("0","1"))
+    test$arrest_made <- factor(test$arrest_made, levels=c("0","1"))
+    
+    conf_matrices[[name]] <- confusionMatrix(predicted_class, test$arrest_made, positive = "1")
+  
+    roc1 <- roc(test$arrest_made, predicted )
+    auc_vals[i] <- roc1$auc
+  }
+  
+  names(conf_matrices) <- alpha_grid
+  
+  # Save the values of each matrix into a table for model comparisons
+  
+  final_stats <- data.frame()
+
+  for (i in conf_matrices) {
+    
+    j <- 0
+    
+    accur <- i[["overall"]][["Accuracy"]]
+    sensit <- i[["byClass"]][["Sensitivity"]]
+    specif <- i[["byClass"]][["Specificity"]]
+    bal <- i[["byClass"]][["Balanced Accuracy"]]
+    lam <- models[[paste0("alpha",j)]][["lambda.1se"]]
+    
+    temp_df <- data.frame(Model_Accuracy = accur, Model_Sensitivity = sensit, 
+                          Model_Specificity = specif, Model_Balance = bal, 
+                          Auc = auc_vals[j+1], Lambda = lam)
+    
+    final_stats <- rbind(final_stats, temp_df)
+    
+    j <- j + 1
+    
+  }
+  
+  # Add alpha and the name of the model/input data set name
+  
+  final_stats$Alpha <- alpha_grid
+  final_stats$Model_Type <- alg
+  final_stats$Input_Data <- datatype
+  
+  # End of Function
+  
+  return(final_stats)
+}
+```
+
+Smote
+```{r warning=FALSE}
+
+elastic_smote <- model_sum(xvars1, smote$arrest_made, "Elastic Net", "Smote Data")
+```
+
+Under
+```{r}
+
+elastic_under <- model_sum(xvars2, under$arrest_made, "Elastic Net", "Undersampled Data")
+```
+
+Full Data (takes a lot of processing power)
+```{r}
+
+#elastic_full <- model_sum(xvars3, traindat$arrest_made, "Elastic Net", "Full Training")
+```
+
+
+```{r}
+
+final_outputs <- rbind(elastic_smote, elastic_under)
+write.csv(final_outputs, '/Users/piersoncooke/GitHub Practice Repos/Nashville-Police-Stops/Data/elastic_outputs.csv')
+```
